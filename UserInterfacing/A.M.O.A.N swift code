@@ -1,0 +1,583 @@
+import SwiftUI
+import CoreBluetooth
+import UIKit
+import Charts
+import Foundation
+
+let serviceUUID = CBUUID(string: "12345678-1234-1234-1234-1234567890ab")
+let rxCharUUID = CBUUID(string: "abcd1234-5678-1234-5678-abcdef012345")
+let txCharUUID = CBUUID(string: "fedc4321-9876-5432-1098-76543210dcba")
+let timeCharUUID = CBUUID(string: "87654321-4321-4321-4321-ba0987654321")
+
+// MARK: - BLEManager
+class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeripheralDelegate {
+    private var centralManager: CBCentralManager!
+    private var peripheral: CBPeripheral?
+    private var rxCharacteristic: CBCharacteristic?
+    private var txCharacteristic: CBCharacteristic?
+    private var timeCharacteristic: CBCharacteristic?
+    
+    var onCSVReceived: ((String) -> Void)?
+    var onConnectionStatusChange: ((Bool) -> Void)?
+    var onNodeDownReceived: ((String) -> Void)?
+    
+    private var csvBuffer: String = ""
+    
+    override init() {
+        super.init()
+        centralManager = CBCentralManager(delegate: self, queue: nil)
+    }
+    
+    func initialize() {
+        if centralManager.state == .poweredOn {
+            centralManager.scanForPeripherals(withServices: [serviceUUID])
+        }
+    }
+    
+    // MARK: - BLE Delegate Methods
+    func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        if central.state == .poweredOn {
+            central.scanForPeripherals(withServices: [serviceUUID])
+        } else {
+            print("Bluetooth not available")
+        }
+    }
+    
+    func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String: Any], rssi RSSI: NSNumber) {
+        centralManager.stopScan()
+        self.peripheral = peripheral
+        self.peripheral?.delegate = self
+        centralManager.connect(peripheral)
+    }
+    
+    func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        peripheral.discoverServices([serviceUUID])
+        onConnectionStatusChange?(true)
+        print("Connected to peripheral: \(peripheral.name ?? "Unknown")")
+    }
+    
+    func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        onConnectionStatusChange?(false)
+        print("Disconnected. Attempting to reconnect...")
+        
+        // Attempt to reconnect
+        centralManager.connect(peripheral)
+    }
+
+    
+    func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+        guard let services = peripheral.services else { return }
+        for service in services {
+            if service.uuid == serviceUUID {
+                peripheral.discoverCharacteristics([rxCharUUID, txCharUUID, timeCharUUID], for: service)
+            }
+        }
+    }
+    
+    func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
+        guard let characteristics = service.characteristics else { return }
+        for char in characteristics {
+            if char.uuid == timeCharUUID {
+                timeCharacteristic = char
+            } else if char.uuid == rxCharUUID {
+                rxCharacteristic = char
+                peripheral.setNotifyValue(true, for: char)
+            } else if char.uuid == txCharUUID {
+                txCharacteristic = char
+            }
+        }
+    }
+    
+    func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+        guard let data = characteristic.value,
+              let str = String(data: data, encoding: .utf8) else { return }
+        
+        csvBuffer += str
+        
+        // Check if first line indicates node down notification
+        if let firstLine = csvBuffer.components(separatedBy: "\n").first?.trimmingCharacters(in: .whitespacesAndNewlines),
+           firstLine.hasPrefix("DOWN:") {
+            
+            // Extract node name after "DOWN:"
+            let components = firstLine.components(separatedBy: ":")
+            if components.count >= 2 {
+                let node = components[1].trimmingCharacters(in: .whitespacesAndNewlines)
+                onNodeDownReceived?(node)
+                print("Down node \(node)")
+            }
+            
+            csvBuffer = ""  // Reset buffer to ignore this message for CSV parsing
+            return
+        }
+        
+        if csvBuffer.contains("END_OF_FILE") {
+            let cleanCSV = csvBuffer.replacingOccurrences(of: "END_OF_FILE", with: "")
+            onCSVReceived?(cleanCSV)
+            if let data = "RECEIVED".data(using: .utf8), let txChar = txCharacteristic {
+                peripheral.writeValue(data, for: txChar, type: .withResponse)
+            }
+            csvBuffer = "" // Reset buffer
+        }
+    }
+
+    
+    func requestCSV(node: String) {
+         
+        guard let syncChar = txCharacteristic else { return }
+        guard let timeChar = timeCharacteristic else { return }
+        
+        let data = "NODE:\(node)".data(using: .utf8)!
+        peripheral?.writeValue(data, for: syncChar, type: .withResponse)
+        
+        let unixTime = String(Int(Date().timeIntervalSince1970))
+        if let data = unixTime.data(using: .utf8) {
+            peripheral?.writeValue(data, for: timeChar, type: .withResponse)
+        }
+    }
+    
+    func exportCSV(_ text: String) {
+        let tmpURL = FileManager.default.temporaryDirectory.appendingPathComponent("bird_data.csv")
+        
+        do {
+            try text.write(to: tmpURL, atomically: true, encoding: .utf8)
+        } catch {
+            print("Failed to write CSV file: \(error)")
+            return
+        }
+        
+        DispatchQueue.main.async {
+            guard let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+                  let rootVC = windowScene.windows.first?.rootViewController else {
+                print("No window scene found for sharing CSV")
+                return
+            }
+            
+            let activityVC = UIActivityViewController(activityItems: [tmpURL], applicationActivities: nil)
+            rootVC.present(activityVC, animated: true)
+        }
+    }
+}
+
+struct WeightReading: Identifiable, Codable {
+    let id: UUID
+    let timestamp: Date
+    let weight: Double
+    
+    init(id: UUID = UUID(), timestamp: Date, weight: Double) {
+        self.id = id
+        self.timestamp = timestamp
+        self.weight = weight
+    }
+}
+
+// MARK: - Model Definitions
+struct DailyAverage: Identifiable, Codable {
+    let id: UUID
+    let date: Date
+    let meanWeight: Double
+    
+    init(date: Date, meanWeight: Double) {
+        self.id = UUID()
+        self.date = date
+        self.meanWeight = meanWeight
+    }
+}
+
+struct Statistics: Codable {
+    let totalBirds: Int
+    let meanWeight: Double
+    let stdDev: Double
+    let morningBirds: Double
+    let afternoonBirds: Double
+    let nightBirds: Double
+    let dailyAverages: [DailyAverage]
+    let minuteAverages: [MinuteAverage] 
+}
+
+struct MinuteAverage: Identifiable, Codable {
+    let id: UUID
+    let timestamp: Date
+    let meanWeight: Double
+    
+    init(timestamp: Date, meanWeight: Double) {
+        self.id = UUID()
+        self.timestamp = timestamp
+        self.meanWeight = meanWeight
+    }
+}
+// MARK: - BLE ViewModel
+class BLEViewModel: ObservableObject {
+    @Published var isConnected = false
+    @Published var csvText = ""
+    @Published var status = "Disconnected"
+    @Published var readings: [WeightReading] = []
+    @Published var stats: Statistics? = nil
+    @Published var downNodes: Set<String> = []
+    @Published var currentlyViewingNode: String? = nil
+    @Published var minuteAverages: [MinuteAverage] = []
+    
+    private var bleManager = BLEManager()
+    private let storageURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!.appendingPathComponent("weight_data.json")
+    
+    init() {
+        loadStoredReadings()
+        
+        bleManager.onConnectionStatusChange = { connected in
+            DispatchQueue.main.async {
+                self.isConnected = connected
+                self.status = connected ? "Connected" : "Disconnected"
+            }
+        }
+        
+        bleManager.onCSVReceived = { csv in
+            DispatchQueue.main.async {
+                self.csvText = csv
+                let newReadings = self.parseCSV(csv)
+                self.readings.append(contentsOf: newReadings)
+                self.saveReadings()
+                self.computeStats()
+            }
+        }
+        
+        bleManager.onNodeDownReceived = { node in
+            DispatchQueue.main.async {
+                print("Entered entry into downNodes array.")
+                self.downNodes.insert(node)
+            }
+        }
+        
+        computeStats()
+        bleManager.initialize()
+    }
+    
+    func requestCSV(node: String) {
+        self.currentlyViewingNode = node
+        bleManager.requestCSV(node: node)
+    }
+    
+    func exportCSV() {
+        bleManager.exportCSV(csvText)
+    }
+    
+    func clearStatistics() {
+        readings = []
+        stats = nil
+        do {
+            try FileManager.default.removeItem(at: storageURL)
+        } catch {
+            print("Failed to delete stored data: \(error)")
+        }
+    }
+    
+    
+    private func parseCSV(_ csv: String) -> [WeightReading] {
+        var parsedReadings: [WeightReading] = []
+        let lines = csv.components(separatedBy: "\n").filter { !$0.isEmpty }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        
+        for line in lines {
+            let components = line.components(separatedBy: ",")
+            if components.count >= 2,
+               let date = formatter.date(from: components[0].trimmingCharacters(in: .whitespaces)),
+               let weight = Double(components[1].trimmingCharacters(in: .whitespaces)) {
+                parsedReadings.append(WeightReading(timestamp: date, weight: weight))
+            }
+        }
+        
+        return parsedReadings
+    }
+    
+    private func saveReadings() {
+        do {
+            let data = try JSONEncoder().encode(readings)
+            try data.write(to: storageURL)
+        } catch {
+            print("Failed to save readings: \(error)")
+        }
+    }
+    
+    private func loadStoredReadings() {
+        do {
+            let data = try Data(contentsOf: storageURL)
+            readings = try JSONDecoder().decode([WeightReading].self, from: data)
+        } catch {
+            print("No previous data or failed to load: \(error)")
+            readings = []
+        }
+    }
+    
+    private func computeStats() {
+        guard !readings.isEmpty else {
+            stats = nil
+            minuteAverages = []           // Clear minute averages if no data
+            return
+        }
+        
+        let mean = readings.map { $0.weight }.reduce(0, +) / Double(readings.count)
+        let stdDev = sqrt(readings.map { pow($0.weight - mean, 2) }.reduce(0, +) / Double(readings.count))
+        
+        let calendar = Calendar.current
+        var dailyMap: [Date: [Double]] = [:]
+        var minuteMap: [Date: [Double]] = [:]
+        
+        var morningWeights: [Double] = []
+        var afternoonWeights: [Double] = []
+        var nightWeights: [Double] = []
+        
+        for reading in readings {
+            let hour = calendar.component(.hour, from: reading.timestamp)
+            switch hour {
+            case 5..<12:
+                morningWeights.append(reading.weight)
+            case 12..<18:
+                afternoonWeights.append(reading.weight)
+            default:
+                nightWeights.append(reading.weight)
+            }
+            
+            let day = calendar.startOfDay(for: reading.timestamp)
+            dailyMap[day, default: []].append(reading.weight)
+            
+            let minute = calendar.date(bySetting: .second, value: 0, of: reading.timestamp)!
+            minuteMap[minute, default: []].append(reading.weight)
+        }
+        
+        let dailyAverages = dailyMap.map { (date, weights) in
+            DailyAverage(date: date, meanWeight: weights.reduce(0, +) / Double(weights.count))
+        }.sorted { $0.date < $1.date }
+        
+        let computedMinuteAverages = minuteMap.map { (date, weights) in
+            MinuteAverage(timestamp: date, meanWeight: weights.reduce(0, +) / Double(weights.count))
+        }.sorted { $0.timestamp < $1.timestamp }
+        
+        func average(_ weights: [Double]) -> Double {
+            weights.isEmpty ? 0 : weights.reduce(0, +) / Double(weights.count)
+        }
+            
+            
+            stats = Statistics(
+                totalBirds: readings.count,
+                meanWeight: mean,
+                stdDev: stdDev,
+                morningBirds: Double(round(100 * average(morningWeights)) / 100),
+                afternoonBirds: Double(round(100 * average(afternoonWeights)) / 100),
+                nightBirds: Double(round(100 * average(nightWeights)) / 100),
+                dailyAverages: dailyAverages,
+                minuteAverages: computedMinuteAverages
+            )
+            
+            // Publish the minute averages for the live chart view
+            self.minuteAverages = computedMinuteAverages
+        }
+
+}
+
+// MARK: - Main View
+struct ContentView: View {
+    @StateObject var viewModel = BLEViewModel()
+    @State private var showStats = false
+    
+    
+    var body: some View {
+        NavigationView {
+            VStack(spacing: 20) {
+                HStack {
+                    Image("Logo")
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 40, height: 40)
+                    Text("A.M.O.A.N")
+                        .font(.caption)
+                        .fontWeight(.medium)
+                    Spacer()
+                    Button("Statistics") {
+                        showStats = true
+                    }.disabled(viewModel.stats == nil)
+                }
+                .padding(.horizontal)
+                .padding(.top, 10)
+                .background(Color(UIColor.secondarySystemBackground))
+                .sheet(isPresented: $showStats) {
+                    if let _ = viewModel.stats {
+                        StatsView(viewModel: viewModel)
+                    }
+                }
+                
+                Divider()
+                
+                GeometryReader { geometry in
+                    VStack {
+                        Spacer()
+                        VStack(spacing: 20) {
+                            Text("BLE Status: \(viewModel.status)")
+                                .foregroundColor(viewModel.isConnected ? .green : .red)
+                            
+                            VStack(spacing: 10) {
+                                ForEach(["ESP_1", "ESP_2", "ESP_3"], id: \.self) { node in
+                                    Button(node) {
+                                        viewModel.requestCSV(node: node)
+                                    }
+                                    .foregroundColor(
+                                        viewModel.downNodes.contains(node) ? .red :
+                                            (viewModel.currentlyViewingNode == node ? .cyan : .black)
+                                    )
+                                }
+                            }.disabled(!viewModel.isConnected)
+
+                            
+                            if viewModel.csvText.isEmpty {
+                                Text("No CSV data yet.")
+                                    .foregroundColor(.gray)
+                            }
+                        }
+                        
+                        if !viewModel.csvText.isEmpty {
+                            ScrollView {
+                                Text(viewModel.csvText)
+                                    .font(.system(.body, design: .monospaced))
+                                    .padding()
+                                    .background(Color(UIColor.secondarySystemBackground))
+                                    .cornerRadius(10)
+                            }
+                            .frame(maxHeight: geometry.size.height * 0.3)
+                            
+                            Button("Share CSV") {
+                                viewModel.exportCSV()
+                            }.padding(.top, 10)
+                        }
+                        
+                        Spacer()
+                    }.frame(width: geometry.size.width)
+                }
+            }
+        }
+    }
+}
+
+// MARK: - StatsView
+struct StatsView: View {
+    @Environment(\.dismiss) var dismiss
+    @ObservedObject var viewModel: BLEViewModel
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            HStack {
+                Button(action: { dismiss() }) {
+                    Image(systemName: "house")
+                        .font(.title2)
+                        .padding()
+                }
+                Spacer()
+                Text("Statistics")
+                    .font(.title2)
+                    .fontWeight(.semibold)
+                Spacer()
+            }
+            .background(Color(UIColor.systemGray6))
+            
+            ScrollView {
+                VStack(alignment: .leading, spacing: 25) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Summary")
+                            .font(.headline)
+                        
+                        HStack {
+                            StatCard(title: "Mean Weight", value: String(format: "%.2f g", viewModel.stats?.meanWeight ?? 0))
+                            StatCard(title: "Std. Dev.", value: String(format: "%.2f", viewModel.stats?.stdDev ?? 0))
+                            StatCard(title: "Birds Count", value: "\(viewModel.stats?.totalBirds ?? 0)")
+                        }
+
+                    }
+                    
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Time of Day")
+                            .font(.headline)
+                        HStack {
+                            StatCard(title: "Morning", 
+                                     value: String(format: "%.1f g", viewModel.stats?.morningBirds ?? 0))
+                            
+                            StatCard(title: "Afternoon", 
+                                     value: String(format: "%.1f g", viewModel.stats?.afternoonBirds ?? 0))
+                            
+                            StatCard(title: "Night", 
+                                     value: String(format: "%.1f g", viewModel.stats?.nightBirds ?? 0))
+
+                        }
+
+                    }
+                    
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Weight Trend")
+                            .font(.headline)
+                        
+                        let minDate = viewModel.minuteAverages.map { $0.timestamp }.min()
+                        let maxDate = viewModel.minuteAverages.map { $0.timestamp }.max()
+                        
+                        Chart(viewModel.minuteAverages) { entry in
+                            LineMark(
+                                x: .value("Time", entry.timestamp),
+                                y: .value("Mean Weight", entry.meanWeight)
+                            )
+                            .interpolationMethod(.catmullRom)
+                            .symbol(Circle())
+                        }
+                        .chartXScale(domain: {
+                            if let minDate, let maxDate {
+                                return minDate...maxDate
+                            } else {
+                                return Date()...Date()
+                            }
+                        }())
+                        .chartXAxis {
+                            AxisMarks(values: .stride(by: .minute, count: 5)) { _ in
+                                AxisGridLine()
+                                AxisTick()
+                                AxisValueLabel(format: .dateTime.hour().minute())
+                            }
+                        }
+                        .frame(height: 200)
+
+                    }
+                }
+                .padding()
+                
+                Button(role: .destructive) {
+                    viewModel.clearStatistics()
+                    dismiss()
+                } label: {
+                    Text("Clear Statistics")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.red)
+                .padding(.top)
+            }
+        }
+    }
+}
+
+struct StatCard: View {
+    var title: String
+    var value: String
+    
+    var body: some View {
+        VStack(spacing: 4) {
+            Text(title)
+                .font(.caption)
+                .foregroundColor(.secondary)
+            Text(value)
+                .font(.headline)
+                .fontWeight(.semibold)
+        }
+        .frame(maxWidth: .infinity)
+        .padding()
+        .background(Color(UIColor.secondarySystemBackground))
+        .cornerRadius(12)
+    }
+}
+
+#Preview {
+    ContentView()
+}
+
